@@ -1,0 +1,4 @@
+tokenbills.db
+__pycache__/
+.venv/
+data/

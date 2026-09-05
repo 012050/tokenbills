@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tokenbills</title>
+<style>
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --border: #30363d;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --green: #3fb950;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans KR", "Malgun Gothic", sans-serif;
+  font-size: 14px;
+}
+.wrap { max-width: 1080px; margin: 0 auto; padding: 20px 24px 48px; }
+header {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  padding: 14px 0 18px; border-bottom: 1px solid var(--border); margin-bottom: 20px;
+}
+h1 { font-size: 20px; margin: 0 14px 0 0; letter-spacing: 0.5px; }
+select, input[type="date"] {
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 10px; font-size: 13px; color-scheme: dark;
+}
+button {
+  background: var(--accent); color: #0d1117; font-weight: 600;
+  border: none; border-radius: 6px; padding: 7px 14px; font-size: 13px; cursor: pointer;
+}
+button:hover { filter: brightness(1.1); }
+#updated { color: var(--muted); font-size: 12px; margin-left: auto; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+.card .label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+.card .value { font-size: 20px; font-weight: 600; }
+.card .value.small { font-size: 16px; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 20px; }
+.panel h2 { font-size: 14px; margin: 0 0 14px; color: var(--muted); font-weight: 600; }
+#chart { display: flex; align-items: flex-end; gap: 2px; height: 240px; padding-top: 8px; overflow: hidden; }
+.bar-wrap { flex: 1 1 0; display: flex; flex-direction: column; justify-content: flex-end; align-items: stretch; min-width: 2px; height: 100%; }
+.bar { background: var(--accent); border-radius: 2px 2px 0 0; min-height: 0; transition: background 0.15s; }
+.bar:hover { background: var(--green); }
+.bar-label {
+  color: var(--muted); font-size: 10px; text-align: center;
+  white-space: nowrap; margin-top: 4px; height: 14px;
+}
+#tip {
+  display: none; position: fixed; z-index: 10; pointer-events: none;
+  background: #1c2128; border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 10px; font-size: 12px; line-height: 1.6; box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+}
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--muted); font-weight: 600; }
+tbody tr:hover { background: rgba(88, 166, 255, 0.06); }
+#status { color: #f85149; font-size: 12px; margin: 0 0 10px; min-height: 16px; }
+.empty { color: var(--muted); text-align: center; padding: 40px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>tokenbills</h1>
+    <select id="unit" title="집계 단위">
+      <option value="month">월</option>
+      <option value="day">일</option>
+      <option value="hour" selected>시간</option>
+    </select>
+    <input type="date" id="start" title="시작일">
+    <span style="color:var(--muted)">~</span>
+    <input type="date" id="end" title="종료일">
+    <button id="refresh">새로고침</button>
+    <span id="updated"></span>
+  </header>
+
+  <div class="cards">
+    <div class="card"><div class="label">총 토큰</div><div class="value" id="sum-total">-</div></div>
+    <div class="card"><div class="label">입력 토큰</div><div class="value small" id="sum-prompt">-</div></div>
+    <div class="card"><div class="label">생성 토큰</div><div class="value small" id="sum-completion">-</div></div>
+    <div class="card"><div class="label">원화 가치</div><div class="value" id="sum-cost">-</div></div>
+    <div class="card"><div class="label">요청 수</div><div class="value" id="sum-requests">-</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>사용량 추이</h2>
+    <div id="chart"></div>
+  </div>
+
+  <div class="panel">
+    <h2>기간별 상세</h2>
+    <div id="status"></div>
+    <table>
+      <thead><tr><th>기간</th><th>입력</th><th>생성</th><th>합계</th><th>원화</th></tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <div id="empty" class="empty" style="display:none">데이터가 없습니다.</div>
+  </div>
+</div>
+<div id="tip"></div>
+
+<script>
+(function () {
+  "use strict";
+  var el = {
+    unit: document.getElementById("unit"),
+    start: document.getElementById("start"),
+    end: document.getElementById("end"),
+    refreshBtn: document.getElementById("refresh"),
+    updated: document.getElementById("updated"),
+    chart: document.getElementById("chart"),
+    tbody: document.getElementById("tbody"),
+    empty: document.getElementById("empty"),
+    status: document.getElementById("status"),
+    tip: document.getElementById("tip"),
+    sumTotal: document.getElementById("sum-total"),
+    sumPrompt: document.getElementById("sum-prompt"),
+    sumCompletion: document.getElementById("sum-completion"),
+    sumCost: document.getElementById("sum-cost"),
+    sumRequests: document.getElementById("sum-requests")
+  };
+
+  function fmtInt(n) { return Math.round(n).toLocaleString("ko-KR"); }
+  function pad2(n) { return String(n).padStart(2, "0"); }
+
+  // 조회 범위의 모든 period 를 생성 (빈 기간은 0 으로 메꿈)
+  function genPeriods(unit, startStr, endStr) {
+    var out = [];
+    var ps = startStr.split("-").map(Number);
+    var pe = endStr.split("-").map(Number);
+    if (unit === "month") {
+      var y = ps[0], m = ps[1];
+      while (y < pe[0] || (y === pe[0] && m <= pe[1])) {
+        out.push(y + "-" + pad2(m));
+        m++; if (m > 12) { m = 1; y++; }
+      }
+    } else if (unit === "day") {
+      var d = Date.UTC(ps[0], ps[1] - 1, ps[2]);
+      var e = Date.UTC(pe[0], pe[1] - 1, pe[2]);
+      while (d <= e) {
+        var dt = new Date(d);
+        out.push(dt.getUTCFullYear() + "-" + pad2(dt.getUTCMonth() + 1) + "-" + pad2(dt.getUTCDate()));
+        d += 86400000;
+      }
+    } else {
+      var h = Date.UTC(ps[0], ps[1] - 1, ps[2], 0);
+      var he = Date.UTC(pe[0], pe[1] - 1, pe[2], 23);
+      while (h <= he) {
+        var hd = new Date(h);
+        out.push(hd.getUTCFullYear() + "-" + pad2(hd.getUTCMonth() + 1) + "-" + pad2(hd.getUTCDate())
+                 + " " + pad2(hd.getUTCHours()) + ":00");
+        h += 3600000;
+      }
+    }
+    return out;
+  }
+
+  function shortLabel(period) {
+    if (period.length === 10) return period.slice(5);   // day:   MM-DD
+    if (period.length === 7)  return period.slice(2);   // month: YY-MM
+    if (period.length === 13) return period.slice(5, 13); // hour: MM-DD HH
+    return period;
+  }
+
+  function showTip(ev, r) {
+    el.tip.innerHTML =
+      "<b>" + r.period + "</b><br>" +
+      "입력 " + fmtInt(r.prompt_tokens) + " · 생성 " + fmtInt(r.completion_tokens) + "<br>" +
+      "합계 " + fmtInt(r.total_tokens) + " 토큰 · " + fmtInt(r.cost_krw) + "원<br>" +
+      "요청 " + fmtInt(r.requests) + "건";
+    el.tip.style.display = "block";
+    var x = ev.clientX + 14;
+    var y = ev.clientY + 14;
+    if (x + el.tip.offsetWidth > window.innerWidth - 8) x = ev.clientX - el.tip.offsetWidth - 10;
+    if (y + el.tip.offsetHeight > window.innerHeight - 8) y = ev.clientY - el.tip.offsetHeight - 10;
+    el.tip.style.left = x + "px";
+    el.tip.style.top = y + "px";
+  }
+  function hideTip() { el.tip.style.display = "none"; }
+
+  function render(data) {
+    var t = data.totals;
+    el.sumTotal.textContent = fmtInt(t.total_tokens);
+    el.sumPrompt.textContent = fmtInt(t.prompt_tokens);
+    el.sumCompletion.textContent = fmtInt(t.completion_tokens);
+    el.sumCost.textContent = fmtInt(t.cost_krw) + "원";
+    el.sumRequests.textContent = fmtInt(t.requests);
+
+    var byPeriod = {};
+    data.series.forEach(function (s) { byPeriod[s.period] = s; });
+
+    var periods = genPeriods(data.unit, data.range.start, data.range.end);
+    if (periods.length > 2000) periods = data.series.map(function (s) { return s.period; });
+    var rows = periods.map(function (p) {
+      return byPeriod[p] || { period: p, requests: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost_krw: 0 };
+    });
+
+    var max = 1;
+    rows.forEach(function (r) { if (r.total_tokens > max) max = r.total_tokens; });
+    var labelEvery = Math.max(1, Math.ceil(rows.length / 14));
+
+    el.chart.innerHTML = "";
+    rows.forEach(function (r, i) {
+      var wrap = document.createElement("div");
+      wrap.className = "bar-wrap";
+      var bar = document.createElement("div");
+      bar.className = "bar";
+      bar.style.height = (r.total_tokens > 0 ? Math.max((r.total_tokens / max) * 100, 1.5) : 0) + "%";
+      bar.addEventListener("mouseenter", function (ev) { showTip(ev, r); });
+      bar.addEventListener("mousemove", function (ev) { showTip(ev, r); });
+      bar.addEventListener("mouseleave", hideTip);
+      wrap.appendChild(bar);
+      var label = document.createElement("div");
+      label.className = "bar-label";
+      label.textContent = (i % labelEvery === 0) ? shortLabel(r.period) : "";
+      wrap.appendChild(label);
+      el.chart.appendChild(wrap);
+    });
+
+    el.tbody.innerHTML = "";
+    el.empty.style.display = t.requests > 0 ? "none" : "block";
+    rows.forEach(function (r) {
+      var tr = document.createElement("tr");
+      [r.period, fmtInt(r.prompt_tokens), fmtInt(r.completion_tokens),
+       fmtInt(r.total_tokens), fmtInt(r.cost_krw) + "원"].forEach(function (val) {
+        var td = document.createElement("td");
+        td.textContent = val;
+        tr.appendChild(td);
+      });
+      el.tbody.appendChild(tr);
+    });
+  }
+
+  async function refresh() {
+    el.status.textContent = "";
+    var params = new URLSearchParams({ unit: el.unit.value });
+    if (el.start.value) params.set("start", el.start.value);
+    if (el.end.value) params.set("end", el.end.value);
+    try {
+      var res = await fetch("/api/usage?" + params.toString(), { cache: "no-store" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      render(await res.json());
+      el.updated.textContent = "마지막 갱신 " + new Date().toLocaleTimeString("ko-KR");
+    } catch (err) {
+      el.status.textContent = "조회 실패: " + err.message;
+    }
+  }
+
+  el.refreshBtn.addEventListener("click", refresh);
+  el.unit.addEventListener("change", refresh);
+  el.start.addEventListener("change", refresh);
+  el.end.addEventListener("change", refresh);
+  window.setInterval(refresh, 30000);
+  refresh();
+})();
+</script>
+</body>
+</html>

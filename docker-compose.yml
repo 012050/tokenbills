@@ -1,0 +1,14 @@
+services:
+  tokenbills:
+    build: .
+    container_name: tokenbills
+    network_mode: host     # 포트 매핑 없이 호스트 8000에 직접 바인드
+    environment:
+      # - VLLM_BASE_URL=http://10.0.0.4:8000
+      - VLLM_BASE_URL=http://localhost:8001
+      - PROMPT_PRICE_KRW=6872
+      - COMPLETION_PRICE_KRW=34360
+      - TZ=Asia/Seoul
+    volumes:
+      - ./data:/app/data
+    restart: always
