@@ -17,13 +17,20 @@ PROXY2_URL="http://127.0.0.1:$PROXY2_PORT"
 
 T="$(mktemp -d)"
 DB="$T/tokenbills.db"
+
+# Windows(Git Bash)에서는 /tmp 가 Windows Python 에 안 보이므로 경로를 변환 (Linux 는 그대로)
+pypath() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf "%s" "$1"; fi; }
+PY_DB="$(pypath "$DB")"
+PY_LAST="$(pypath "$T/last.json")"
 PASS=0
 FAIL=0
 MOCK_PID=""
 PROXY_PID=""
 PROXY2_PID=""
+PROXY3_PID=""
 
 cleanup() {
+  [ -n "$PROXY3_PID" ] && kill "$PROXY3_PID" >/dev/null 2>&1
   [ -n "$PROXY2_PID" ] && kill "$PROXY2_PID" >/dev/null 2>&1
   [ -n "$PROXY_PID" ] && kill "$PROXY_PID" >/dev/null 2>&1
   [ -n "$MOCK_PID" ] && kill "$MOCK_PID" >/dev/null 2>&1
@@ -52,8 +59,8 @@ if ! wait_http "$MOCK_URL/v1/models"; then
 fi
 
 echo "== tokenbills 기동 ($PROXY_URL)"
-TOKENBILLS_DB="$DB" VLLM_BASE_URL="$MOCK_URL" TZ=Asia/Seoul \
-  "$PY" -m uvicorn main:app --host 127.0.0.1 --port "$PROXY_PORT" >"$T/proxy.log" 2>&1 &
+TOKENBILLS_DB="$PY_DB" VLLM_BASE_URL="$MOCK_URL" TZ=Asia/Seoul \
+  "$PY" -m uvicorn main:app --no-proxy-headers --host 127.0.0.1 --port "$PROXY_PORT" >"$T/proxy.log" 2>&1 &
 PROXY_PID=$!
 if ! wait_http "$PROXY_URL/health"; then
   echo "tokenbills 기동 실패:"; cat "$T/proxy.log"; exit 1
@@ -84,7 +91,7 @@ cmp -s "$T/via_proxy.json" "$T/direct.json" \
 
 cat > "$T/t_xff.py" <<EOF
 import json
-last = json.load(open("$T/last.json"))
+last = json.load(open("$PY_LAST"))
 h = last["headers"]
 assert h.get("x-forwarded-for") == "127.0.0.1", h.get("x-forwarded-for")
 assert h.get("x-test-header") == "abc123", h.get("x-test-header")
@@ -117,7 +124,7 @@ curl -s -o "$T/err_direct.json" -X POST "$MOCK_URL/v1/chat/completions" \
 # ---------------------------------------------------------------- 8.2 기록
 cat > "$T/t_db2.py" <<EOF
 import sqlite3
-conn = sqlite3.connect("$DB")
+conn = sqlite3.connect("$PY_DB")
 rows = conn.execute("SELECT prompt_tokens, completion_tokens FROM usage ORDER BY ts").fetchall()
 assert rows == [(123, 45), (123, 45)], rows
 EOF
@@ -151,7 +158,7 @@ curl -s -X POST "$PROXY_URL/v1/responses" \
   -H 'content-type: application/json' -d '{"model":"no-usage","input":"x"}' -o /dev/null
 cat > "$T/t_db3.py" <<EOF
 import sqlite3
-conn = sqlite3.connect("$DB")
+conn = sqlite3.connect("$PY_DB")
 rows = conn.execute("SELECT prompt_tokens, completion_tokens FROM usage ORDER BY ts").fetchall()
 assert rows == [(123, 45), (123, 45), (7, 0), (31, 7), (31, 7)], rows
 EOF
@@ -178,9 +185,9 @@ EOF
   || { bad "8.4 기본 요율 cost_krw"; "$PY" "$T/t_price.py" || true; }
 
 # 환경변수 요율 우선 (동일 DB 를 읽는 두 번째 인스턴스, 요율 2000/4000)
-TOKENBILLS_DB="$DB" VLLM_BASE_URL="$MOCK_URL" \
+TOKENBILLS_DB="$PY_DB" VLLM_BASE_URL="$MOCK_URL" \
   PROMPT_PRICE_KRW=2000 COMPLETION_PRICE_KRW=4000 TZ=Asia/Seoul \
-  "$PY" -m uvicorn main:app --host 127.0.0.1 --port "$PROXY2_PORT" >"$T/proxy2.log" 2>&1 &
+  "$PY" -m uvicorn main:app --no-proxy-headers --host 127.0.0.1 --port "$PROXY2_PORT" >"$T/proxy2.log" 2>&1 &
 PROXY2_PID=$!
 if wait_http "$PROXY2_URL/health"; then
   cat > "$T/t_price2.py" <<EOF
@@ -198,15 +205,98 @@ else
 fi
 kill "$PROXY2_PID" >/dev/null 2>&1; PROXY2_PID=""
 
+# ---------------------------------------------------------------- 9. IP별 기록/조회 (신규)
+# 9.1 직결: 위조 XFF 무시 (신뢰 프록시가 아닌 소스) → TCP 소스 IP 기록
+# 9.2 신뢰 프록시(TRUSTED_PROXIES): XFF 첫 항목 = 실 클라이언트 IP / XFF 없으면 TCP 소스 IP
+# 9.3 /api/clients IP별 집계 + /api/usage?ip= 필터
+IP_PORT="${PROXY3_PORT:-$((PROXY2_PORT + 100))}"
+IP_URL="http://127.0.0.1:$IP_PORT"
+IP_DB="$T/ip.db"
+PY_IP_DB="$(pypath "$IP_DB")"
+
+TOKENBILLS_DB="$PY_IP_DB" VLLM_BASE_URL="$MOCK_URL" TZ=Asia/Seoul \
+  "$PY" -m uvicorn main:app --no-proxy-headers --host 127.0.0.1 --port "$IP_PORT" >"$T/proxy_ip.log" 2>&1 &
+PROXY3_PID=$!
+if wait_http "$IP_URL/health"; then
+  curl -s -X POST "$IP_URL/v1/chat/completions" \
+    -H 'content-type: application/json' -H 'X-Forwarded-For: 203.0.113.99' \
+    -d "$B" -o /dev/null
+  cat > "$T/t_ip1.py" <<EOF
+import sqlite3
+conn = sqlite3.connect("$PY_IP_DB")
+rows = conn.execute("SELECT client_ip, prompt_tokens FROM usage ORDER BY ts").fetchall()
+assert rows == [("127.0.0.1", 123)], rows
+EOF
+  "$PY" "$T/t_ip1.py" >/dev/null 2>&1 \
+    && ok "9.1 직결 요청: 위조 XFF 무시, TCP 소스 IP 기록" \
+    || { bad "9.1 직결 요청: 위조 XFF 무시"; "$PY" "$T/t_ip1.py" || true; }
+else
+  bad "9.1 IP 테스트 인스턴스 기동 실패 (proxy_ip.log)"
+fi
+kill "$PROXY3_PID" >/dev/null 2>&1; PROXY3_PID=""
+
+TOKENBILLS_DB="$PY_IP_DB" VLLM_BASE_URL="$MOCK_URL" TRUSTED_PROXIES=127.0.0.1 TZ=Asia/Seoul \
+  "$PY" -m uvicorn main:app --no-proxy-headers --host 127.0.0.1 --port "$IP_PORT" >"$T/proxy_ip2.log" 2>&1 &
+PROXY3_PID=$!
+if wait_http "$IP_URL/health"; then
+  curl -s -X POST "$IP_URL/v1/chat/completions" \
+    -H 'content-type: application/json' -H 'X-Forwarded-For: 203.0.113.7' \
+    -d "$B" -o /dev/null
+  sleep 0.2
+  curl -s -X POST "$IP_URL/v1/chat/completions" \
+    -H 'content-type: application/json' -d "$B" -o /dev/null
+  cat > "$T/t_ip2.py" <<EOF
+import sqlite3
+conn = sqlite3.connect("$PY_IP_DB")
+rows = conn.execute("SELECT client_ip, prompt_tokens, completion_tokens FROM usage ORDER BY ts").fetchall()
+assert rows[1:] == [("203.0.113.7", 123, 45), ("127.0.0.1", 123, 45)], rows
+EOF
+  "$PY" "$T/t_ip2.py" >/dev/null 2>&1 \
+    && ok "9.2 신뢰 프록시: XFF 첫 항목 기록 (XFF 없으면 TCP 소스 IP)" \
+    || { bad "9.2 신뢰 프록시 XFF 기록"; "$PY" "$T/t_ip2.py" || true; }
+  cat > "$T/t_ip3.py" <<EOF
+import json, urllib.request
+port = $IP_PORT
+d = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/clients"))
+assert d["totals"]["requests"] == 3, d
+ips = {c["client_ip"]: c for c in d["clients"]}
+assert set(ips) == {"127.0.0.1", "203.0.113.7"}, ips
+assert ips["203.0.113.7"]["requests"] == 1
+assert ips["203.0.113.7"]["prompt_tokens"] == 123
+assert ips["203.0.113.7"]["completion_tokens"] == 45
+assert ips["127.0.0.1"]["requests"] == 2
+assert ips["127.0.0.1"]["total_tokens"] == 336
+expected = 369 * 6872.0 / 1e6 + 135 * 34360.0 / 1e6
+assert abs(d["totals"]["cost_krw"] - expected) < 1e-9, d["totals"]
+assert d["clients"][0]["client_ip"] == "127.0.0.1"  # 토큰 합계 내림차순
+d0 = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/clients?start=2000-01-01&end=2000-01-31"))
+assert d0["totals"]["requests"] == 0 and d0["clients"] == []
+f = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/usage?unit=day&ip=203.0.113.7"))
+assert f["ip"] == "203.0.113.7"
+assert f["totals"]["requests"] == 1 and f["totals"]["prompt_tokens"] == 123
+f0 = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/usage?unit=day&ip=192.0.2.55"))
+assert f0["totals"]["requests"] == 0 and f0["series"] == []
+EOF
+  "$PY" "$T/t_ip3.py" >/dev/null 2>&1 \
+    && ok "9.3 /api/clients 집계 + /api/usage?ip= 필터" \
+    || { bad "9.3 /api/clients + ip 필터"; "$PY" "$T/t_ip3.py" || true; }
+else
+  bad "9.2 신뢰 프록시 인스턴스 기동 실패 (proxy_ip2.log)"
+fi
+kill "$PROXY3_PID" >/dev/null 2>&1; PROXY3_PID=""
+
 # ---------------------------------------------------------------- 8.5 웹/API 일관성
 cat > "$T/t_api.py" <<EOF
 import json, sqlite3, urllib.request
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
+try:
+    from zoneinfo import ZoneInfo
+    KST = ZoneInfo("Asia/Seoul")
+except Exception:
+    KST = timezone(timedelta(hours=9))  # tzdata 없는 환경(Windows) 폴백
 
 port = $PROXY_PORT
-KST = ZoneInfo("Asia/Seoul")
-conn = sqlite3.connect("$DB")
+conn = sqlite3.connect("$PY_DB")
 rows = conn.execute("SELECT ts, prompt_tokens, completion_tokens FROM usage").fetchall()
 
 for unit in ("month", "day", "hour"):
@@ -221,6 +311,7 @@ for unit in ("month", "day", "hour"):
     assert sum(s["prompt_tokens"] for s in d["series"]) == t["prompt_tokens"]
     assert sum(s["completion_tokens"] for s in d["series"]) == t["completion_tokens"]
     for s in d["series"]:
+        assert sum(s.get("clients", {}).values()) == s["total_tokens"], s
         p = s["period"]
         if unit == "month":
             assert len(p) == 7 and p[4] == "-"

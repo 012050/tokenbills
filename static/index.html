@@ -50,6 +50,11 @@ button:hover { filter: brightness(1.1); }
 .bar-wrap { flex: 1 1 0; display: flex; flex-direction: column; justify-content: flex-end; align-items: stretch; min-width: 2px; height: 100%; }
 .bar { background: var(--accent); border-radius: 2px 2px 0 0; min-height: 0; transition: background 0.15s; }
 .bar:hover { background: var(--green); }
+.bar.stacked { display: flex; flex-direction: column-reverse; }
+.seg { width: 100%; }
+#legend { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 10px; font-size: 12px; color: var(--muted); }
+.lg-item { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.lg-swatch { width: 10px; height: 10px; border-radius: 2px; }
 .bar-label {
   color: var(--muted); font-size: 10px; text-align: center;
   white-space: nowrap; margin-top: 4px; height: 14px;
@@ -95,6 +100,7 @@ tbody tr:hover { background: rgba(88, 166, 255, 0.06); }
   <div class="panel">
     <h2>사용량 추이</h2>
     <div id="chart"></div>
+<div id="legend"></div>
   </div>
 
   <div class="panel">
@@ -105,6 +111,14 @@ tbody tr:hover { background: rgba(88, 166, 255, 0.06); }
       <tbody id="tbody"></tbody>
     </table>
     <div id="empty" class="empty" style="display:none">데이터가 없습니다.</div>
+  </div>
+  <div class="panel">
+    <h2>클라이언트 IP별 집계</h2>
+    <table>
+      <thead><tr><th>클라이언트 IP</th><th>요청</th><th>입력</th><th>생성</th><th>합계</th><th>원화</th></tr></thead>
+      <tbody id="ctbody"></tbody>
+    </table>
+    <div id="cempty" class="empty" style="display:none">데이터가 없습니다.</div>
   </div>
 </div>
 <div id="tip"></div>
@@ -127,7 +141,10 @@ tbody tr:hover { background: rgba(88, 166, 255, 0.06); }
     sumPrompt: document.getElementById("sum-prompt"),
     sumCompletion: document.getElementById("sum-completion"),
     sumCost: document.getElementById("sum-cost"),
-    sumRequests: document.getElementById("sum-requests")
+    sumRequests: document.getElementById("sum-requests"),
+    ctbody: document.getElementById("ctbody"),
+    cempty: document.getElementById("cempty"),
+    legend: document.getElementById("legend")
   };
 
   function fmtInt(n) { return Math.round(n).toLocaleString("ko-KR"); }
@@ -173,11 +190,25 @@ tbody tr:hover { background: rgba(88, 166, 255, 0.06); }
   }
 
   function showTip(ev, r) {
-    el.tip.innerHTML =
+    var tipHtml =
       "<b>" + r.period + "</b><br>" +
       "입력 " + fmtInt(r.prompt_tokens) + " · 생성 " + fmtInt(r.completion_tokens) + "<br>" +
       "합계 " + fmtInt(r.total_tokens) + " 토큰 · " + fmtInt(r.cost_krw) + "원<br>" +
       "요청 " + fmtInt(r.requests) + "건";
+    var tipEntries = Object.keys(r.clients || {}).map(function (ip) { return { ip: ip, v: r.clients[ip] }; })
+      .sort(function (a, b) { return b.v - a.v; });
+    if (tipEntries.length > 0) {
+      tipHtml += "<br><span style=\"color:var(--muted)\">IP별</span>";
+      tipEntries.slice(0, 5).forEach(function (e) {
+        tipHtml += "<br>" + e.ip + " · " + fmtInt(e.v) + " 토큰";
+      });
+      if (tipEntries.length > 5) {
+        var tipRest = 0;
+        tipEntries.slice(5).forEach(function (e) { tipRest += e.v; });
+        tipHtml += "<br>기타 " + fmtInt(tipRest) + " 토큰";
+      }
+    }
+    el.tip.innerHTML = tipHtml;
     el.tip.style.display = "block";
     var x = ev.clientX + 14;
     var y = ev.clientY + 14;
@@ -207,6 +238,43 @@ tbody tr:hover { background: rgba(88, 166, 255, 0.06); }
 
     var max = 1;
     rows.forEach(function (r) { if (r.total_tokens > max) max = r.total_tokens; });
+    var ipTotals = {};
+    data.series.forEach(function (s) {
+      var scs = s.clients || {};
+      Object.keys(scs).forEach(function (ip) { ipTotals[ip] = (ipTotals[ip] || 0) + scs[ip]; });
+    });
+    var ipOrder = Object.keys(ipTotals).sort(function (a, b) { return ipTotals[b] - ipTotals[a]; });
+    var palette = ["#58a6ff", "#3fb950", "#f85149", "#d29922", "#bc8cff", "#39c5cf", "#f778ba", "#ffa657"];
+    var OTHER_COLOR = "#8b949e";
+    var ipColor = {};
+    ipOrder.forEach(function (ip, i) { if (i < palette.length) ipColor[ip] = palette[i]; });
+    el.legend.innerHTML = "";
+    ipOrder.slice(0, palette.length).forEach(function (ip) {
+      var li = document.createElement("span");
+      li.className = "lg-item";
+      var sw = document.createElement("span");
+      sw.className = "lg-swatch";
+      sw.style.background = ipColor[ip];
+      var tx = document.createElement("span");
+      tx.textContent = ip + " · " + fmtInt(ipTotals[ip]);
+      li.appendChild(sw);
+      li.appendChild(tx);
+      el.legend.appendChild(li);
+    });
+    if (ipOrder.length > palette.length) {
+      var otherTotal = 0;
+      ipOrder.slice(palette.length).forEach(function (ip) { otherTotal += ipTotals[ip]; });
+      var oitem = document.createElement("span");
+      oitem.className = "lg-item";
+      var os = document.createElement("span");
+      os.className = "lg-swatch";
+      os.style.background = OTHER_COLOR;
+      var ot = document.createElement("span");
+      ot.textContent = "기타 · " + fmtInt(otherTotal);
+      oitem.appendChild(os);
+      oitem.appendChild(ot);
+      el.legend.appendChild(oitem);
+    }
     var labelEvery = Math.max(1, Math.ceil(rows.length / 14));
 
     el.chart.innerHTML = "";
@@ -215,7 +283,25 @@ tbody tr:hover { background: rgba(88, 166, 255, 0.06); }
       wrap.className = "bar-wrap";
       var bar = document.createElement("div");
       bar.className = "bar";
-      bar.style.height = (r.total_tokens > 0 ? Math.max((r.total_tokens / max) * 100, 1.5) : 0) + "%";
+      if (r.total_tokens > 0) {
+        bar.style.height = Math.max((r.total_tokens / max) * 100, 1.5) + "%";
+        var segs = Object.keys(r.clients || {}).map(function (ip) { return { ip: ip, v: r.clients[ip] }; })
+          .sort(function (a, b) { return b.v - a.v; });
+        var segRest = 0;
+        var kept = [];
+        segs.forEach(function (e) { if (ipColor[e.ip]) kept.push(e); else segRest += e.v; });
+        if (segRest > 0) kept.push({ ip: "기타", v: segRest });
+        bar.classList.add("stacked");
+        kept.forEach(function (e) {
+          var seg = document.createElement("div");
+          seg.className = "seg";
+          seg.style.height = (e.v / r.total_tokens) * 100 + "%";
+          seg.style.background = ipColor[e.ip] || OTHER_COLOR;
+          bar.appendChild(seg);
+        });
+      } else {
+        bar.style.height = "0";
+      }
       bar.addEventListener("mouseenter", function (ev) { showTip(ev, r); });
       bar.addEventListener("mousemove", function (ev) { showTip(ev, r); });
       bar.addEventListener("mouseleave", hideTip);
@@ -241,6 +327,36 @@ tbody tr:hover { background: rgba(88, 166, 255, 0.06); }
     });
   }
 
+  function renderClients(data) {
+    var rows = data.clients || [];
+    el.ctbody.innerHTML = "";
+    el.cempty.style.display = rows.length > 0 ? "none" : "block";
+    rows.forEach(function (r) {
+      var tr = document.createElement("tr");
+      [r.client_ip, fmtInt(r.requests), fmtInt(r.prompt_tokens),
+       fmtInt(r.completion_tokens), fmtInt(r.total_tokens),
+       fmtInt(r.cost_krw) + "원"].forEach(function (val) {
+        var td = document.createElement("td");
+        td.textContent = val;
+        tr.appendChild(td);
+      });
+      el.ctbody.appendChild(tr);
+    });
+  }
+
+  async function refreshClients() {
+    var params = new URLSearchParams();
+    if (el.start.value) params.set("start", el.start.value);
+    if (el.end.value) params.set("end", el.end.value);
+    try {
+      var res = await fetch("/api/clients?" + params.toString(), { cache: "no-store" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      renderClients(await res.json());
+    } catch (err) {
+      el.ctbody.innerHTML = "";
+    }
+  }
+
   async function refresh() {
     el.status.textContent = "";
     var params = new URLSearchParams({ unit: el.unit.value });
@@ -250,6 +366,7 @@ tbody tr:hover { background: rgba(88, 166, 255, 0.06); }
       var res = await fetch("/api/usage?" + params.toString(), { cache: "no-store" });
       if (!res.ok) throw new Error("HTTP " + res.status);
       render(await res.json());
+      refreshClients();
       el.updated.textContent = "마지막 갱신 " + new Date().toLocaleTimeString("ko-KR");
     } catch (err) {
       el.status.textContent = "조회 실패: " + err.message;

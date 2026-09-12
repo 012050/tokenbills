@@ -106,3 +106,17 @@ docker compose up -d --build                 # 8000에 서빙
 docker logs -f tokenbills                    # 로그
 docker compose down                          # 정지
 ```
+
+## 9. 기능 추가: 클라이언트 IP 기록·집계 (2026-09-11)
+
+- **목적**: 어느 클라이언트(IP)가 어떤 토큰을 사용했는지 구분. 내부망 직결 요청은 TCP 소스 IP, 외부망(nginx HTTPS 경유) 요청은 X-Forwarded-For 첫 항목을 기록.
+- **인증**: tokenbills에 구현 없음 — 키 확인(CIDR 허용 OR API key)은 내부망 앞단 nginx(192.168.1.3)에서 처리.
+- **신규 env**: `TRUSTED_PROXIES` (쉼표 구분, IP/CIDR). 매칭 소스는 신뢰 프록시로 보고 XFF 첫 항목을 클라이언트 IP로 기록. 미설정 시 기존 동작(TCP 소스 IP) 유지.
+- **DB**: `usage` 테이블에 `client_ip` 컬럼 추가 (기존 DB는 `ALTER TABLE` 자동 마이그레이션, 기존 행은 빈 문자열) + `idx_usage_client_ts` 인덱스.
+- **API**: `/api/usage`에 `ip=` 필터 파라미터 추가 (응답에 `ip` 포함). `/api/clients` 신규 — 동일 기간 파라미터(start/end)로 IP별 요청수/입력/생성/합계/원화, 토큰 합계 내림차순.
+- **웹**: 대시보드에 "클라이언트 IP별 집계" 표 추가 (동일 기간, 30초 자동 갱신).
+- **docker-compose.yml**: `TRUSTED_PROXIES=192.168.1.3` 추가.
+- **테스트**: `test/run_tests.sh` 9절 신규 — 9.1 직결 위조 XFF 무시 / 9.2 신뢰 프록시 XFF 기록 (XFF 없으면 TCP 소스 IP) / 9.3 `/api/clients` 집계 + `/api/usage?ip=` 필터.
+- **nginx 설정 참조**: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` 필수 (외부 클라이언트 실 IP 전달).- **uvicorn XFF 신뢰 수정 (중요)**: uvicorn 기본 동작(`proxy_headers=True`)이 XFF 헤더로 클라이언트 주소를 덮어쓰는 것을 확인 → 직결 클라이언트가 XFF를 위조하면 그대로 기록되는 문제를 막기 위해 uvicorn에서 XFF 처리를 끄고 `TRUSTED_PROXIES`로 앱 레벨에서만 처리하도록 변경. Dockerfile CMD `--no-proxy-headers`, `main.py` `uvicorn.run(..., proxy_headers=False)`, `test/run_tests.sh` 전체 기동 라인에 동일 플래그 추가.
+- **run_tests.sh Windows 호환**: `pypath()`(cygpath) 변환으로 Windows(Git Bash) 개발 환경에서도 스위트 실행 가능 (Linux에서는 경로 그대로, 동작 동일). `t_api.py`에 tzdata 없는 환경을 위한 고정 오프셋 KST 폴백 추가.- **테스트 결과**: `bash test/run_tests.sh` → **PASS 19 / FAIL 0** (기존 16 + 신규 3. Windows 개발 PC에서 Git Bash + Windows Python 3.14로 실행 확인, Linux 동작에도 영향 없음).- **사용량 추이 차트 IP별 스택 (2026-09-12)**: `/api/usage`의 series 항목에 `clients` 맵(IP별 토큰 합계, 빈 IP는 "unknown") 추가. 대시보드 차트를 IP별 색상 스택 바로 변경 — 최대 8개 IP에 팔레트 색상, 초과분은 회색 "기타"로 병합, 범례(IP + 총 토큰)와 툴팁(IP별 분해, 상위 5 + 기타) 표시. `t_api.py`에 series별 `sum(clients) == total_tokens` 검증 추가.
+

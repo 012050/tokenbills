@@ -7,6 +7,7 @@
 - /health, 그리고 그 외 모든 GET 은 웹 페이지 (static/index.html) 서빙
 """
 
+import ipaddress
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8001").rstrip("/")
 TOKENBILLS_DB = os.environ.get("TOKENBILLS_DB", "./tokenbills.db")
+TRUSTED_PROXIES = os.environ.get("TRUSTED_PROXIES", "")
 DEFAULT_PROMPT_PRICE_KRW = 6872.0
 DEFAULT_COMPLETION_PRICE_KRW = 34360.0
 
@@ -48,6 +50,23 @@ REQUEST_DROP = HOP_BY_HOP | {"content-length"}
 RESPONSE_DROP = HOP_BY_HOP | {"content-length", "content-encoding"}
 
 log = logging.getLogger("tokenbills")
+
+def _parse_trusted_proxies(raw: str) -> list:
+    """TRUSTED_PROXIES (쉼표 구분, IP/CIDR) → network 객체 목록."""
+    nets = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            log.warning("invalid TRUSTED_PROXIES entry %r ignored", item)
+    return nets
+
+
+TRUSTED_PROXY_NETS = _parse_trusted_proxies(TRUSTED_PROXIES)
+
 
 try:
     KST = ZoneInfo("Asia/Seoul")
@@ -74,23 +93,32 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS usage (
                 id                TEXT PRIMARY KEY,
                 ts                REAL NOT NULL,
+                client_ip         TEXT NOT NULL DEFAULT '',
                 prompt_tokens     INTEGER NOT NULL,
                 completion_tokens INTEGER NOT NULL DEFAULT 0
             )
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage (ts)")
+        # 기존 운영 DB 마이그레이션 (client_ip 컬럼 추가 전 생성된 경우)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(usage)")}
+        if "client_ip" not in cols:
+            conn.execute(
+                "ALTER TABLE usage ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''"
+            )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_client_ts ON usage (client_ip, ts)")
         conn.commit()
     finally:
         conn.close()
 
 
-def record_usage(prompt_tokens: int, completion_tokens: int) -> None:
+def record_usage(prompt_tokens: int, completion_tokens: int, client_ip: str = "") -> None:
     conn = _connect()
     try:
         conn.execute(
-            "INSERT INTO usage (id, ts, prompt_tokens, completion_tokens) VALUES (?, ?, ?, ?)",
-            (uuid.uuid4().hex, time.time(), int(prompt_tokens), int(completion_tokens)),
+            "INSERT INTO usage (id, ts, client_ip, prompt_tokens, completion_tokens)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (uuid.uuid4().hex, time.time(), client_ip, int(prompt_tokens), int(completion_tokens)),
         )
         conn.commit()
     except (sqlite3.Error, TypeError, ValueError):
@@ -116,12 +144,13 @@ def _normalize_usage(usage: object) -> tuple[int, int] | None:
     return prompt, completion
 
 
-def _record_if_any(usage: object) -> None:
+def _record_if_any(usage: object, client_ip: str = "") -> None:
     """usage 객체가 있으면 1행 기록, 없으면 아무것도 안 한다 (추정 금지)."""
     normalized = _normalize_usage(usage)
     if normalized is None:
         return
-    record_usage(*normalized)
+    prompt_tokens, completion_tokens = normalized
+    record_usage(prompt_tokens, completion_tokens, client_ip)
 
 
 def _usage_from_json(raw: bytes) -> object:
@@ -186,6 +215,24 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="tokenbills", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 
+def _is_trusted_proxy(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in TRUSTED_PROXY_NETS)
+
+
+def _client_ip(request: Request) -> str:
+    """클라이언트 IP: 신뢰 프록시(예: nginx)에서 온 요청은 XFF 첫 항목, 그 외는 TCP 소스 IP."""
+    peer = request.client.host if request.client is not None else "unknown"
+    if _is_trusted_proxy(peer):
+        first = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        if first:
+            return first
+    return peer
+
+
 def _forward_headers(request: Request) -> dict:
     headers = {
         key: value for key, value in request.headers.items() if key not in REQUEST_DROP
@@ -224,6 +271,7 @@ async def proxy(path: str, request: Request) -> Response:
     upstream: httpx.AsyncClient = request.app.state.upstream
     body = await request.body()
     is_tracked = request.method == "POST" and path in TRACKED_ENDPOINTS
+    client_ip = _client_ip(request)
     if request.method == "POST" and path in INJECT_USAGE_ENDPOINTS:
         body, _ = _maybe_inject_include_usage(body)
 
@@ -252,7 +300,7 @@ async def proxy(path: str, request: Request) -> Response:
             return JSONResponse(status_code=502, content={"detail": "upstream unavailable"})
         await resp.aclose()
         if is_tracked:
-            _record_if_any(_usage_from_json(raw))
+            _record_if_any(_usage_from_json(raw), client_ip)
         return Response(content=raw, status_code=resp.status_code, headers=_response_headers(resp))
 
     state = {"usage": None, "buf": b""}
@@ -270,7 +318,7 @@ async def proxy(path: str, request: Request) -> Response:
             except Exception:
                 pass
             if is_tracked:
-                _record_if_any(state["usage"])
+                _record_if_any(state["usage"], client_ip)
 
     return StreamingResponse(
         event_stream(), status_code=resp.status_code, headers=_response_headers(resp)
@@ -306,20 +354,8 @@ def _env_price(name: str, default: float) -> float:
         return default
 
 
-def _bucket_key(ts: float, unit: str) -> str:
-    dt = datetime.fromtimestamp(ts, tz=KST)
-    if unit == "month":
-        return dt.strftime("%Y-%m")
-    if unit == "hour":
-        return dt.strftime("%Y-%m-%d %H:00")
-    return dt.strftime("%Y-%m-%d")
-
-
-@app.get("/api/usage")
-async def api_usage(unit: str = "day", start: str | None = None, end: str | None = None) -> dict:
-    if unit not in ("month", "day", "hour"):
-        raise HTTPException(status_code=422, detail="unit must be month, day or hour")
-
+def _resolve_range(start: str | None, end: str | None) -> tuple[datetime, float, str]:
+    """KST 기준 (start_dt, end_epoch, end_date_str) 범위 해석. /api/usage·/api/clients 공유."""
     now = datetime.now(tz=KST)
     if start is None:
         start_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -331,28 +367,50 @@ async def api_usage(unit: str = "day", start: str | None = None, end: str | None
         end_date = _parse_date(end).date()
     if end_date < start_dt.date():
         raise HTTPException(status_code=422, detail="end must be on/after start")
-
-    start_epoch = start_dt.timestamp()
     end_epoch = datetime.combine(
         end_date + timedelta(days=1), datetime.min.time(), tzinfo=KST
     ).timestamp()
+    return start_dt, end_epoch, end_date.isoformat()
+
+
+def _bucket_key(ts: float, unit: str) -> str:
+    dt = datetime.fromtimestamp(ts, tz=KST)
+    if unit == "month":
+        return dt.strftime("%Y-%m")
+    if unit == "hour":
+        return dt.strftime("%Y-%m-%d %H:00")
+    return dt.strftime("%Y-%m-%d")
+
+
+@app.get("/api/usage")
+async def api_usage(unit: str = "day", start: str | None = None, end: str | None = None, ip: str | None = None) -> dict:
+    if unit not in ("month", "day", "hour"):
+        raise HTTPException(status_code=422, detail="unit must be month, day or hour")
+
+    start_dt, end_epoch, end_str = _resolve_range(start, end)
+
+    sql = "SELECT ts, client_ip, prompt_tokens, completion_tokens FROM usage"
+    sql += " WHERE ts >= ? AND ts < ?"
+    params: list = [start_dt.timestamp(), end_epoch]
+    if ip is not None:
+        sql += " AND client_ip = ?"
+        params.append(ip)
+    sql += " ORDER BY ts"
 
     conn = _connect()
     try:
-        rows = conn.execute(
-            "SELECT ts, prompt_tokens, completion_tokens FROM usage"
-            " WHERE ts >= ? AND ts < ? ORDER BY ts",
-            (start_epoch, end_epoch),
-        ).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     finally:
         conn.close()
 
-    buckets: dict[str, list[int]] = {}
-    for ts, prompt_tokens, completion_tokens in rows:
-        bucket = buckets.setdefault(_bucket_key(ts, unit), [0, 0, 0])
+    buckets: dict[str, list] = {}
+    for ts, client_ip, prompt_tokens, completion_tokens in rows:
+        bucket = buckets.setdefault(_bucket_key(ts, unit), [0, 0, 0, {}])
         bucket[0] += 1
         bucket[1] += prompt_tokens
         bucket[2] += completion_tokens
+        ip_key = client_ip or "unknown"
+        bucket[3][ip_key] = bucket[3].get(ip_key, 0) + prompt_tokens + completion_tokens
 
     prompt_price = _env_price("PROMPT_PRICE_KRW", DEFAULT_PROMPT_PRICE_KRW)
     completion_price = _env_price("COMPLETION_PRICE_KRW", DEFAULT_COMPLETION_PRICE_KRW)
@@ -360,9 +418,9 @@ async def api_usage(unit: str = "day", start: str | None = None, end: str | None
     total_prompt = sum(b[1] for b in buckets.values())
     total_completion = sum(b[2] for b in buckets.values())
 
-    return {
+    result = {
         "unit": unit,
-        "range": {"start": start_dt.strftime("%Y-%m-%d"), "end": end_date.isoformat()},
+        "range": {"start": start_dt.strftime("%Y-%m-%d"), "end": end_str},
         "totals": {
             "requests": sum(b[0] for b in buckets.values()),
             "prompt_tokens": total_prompt,
@@ -379,9 +437,62 @@ async def api_usage(unit: str = "day", start: str | None = None, end: str | None
                 "completion_tokens": b[2],
                 "total_tokens": b[1] + b[2],
                 "cost_krw": b[1] * prompt_price / 1e6 + b[2] * completion_price / 1e6,
+                "clients": b[3],
             }
             for key, b in sorted(buckets.items())
         ],
+    }
+    if ip is not None:
+        result["ip"] = ip
+    return result
+
+
+@app.get("/api/clients")
+async def api_clients(start: str | None = None, end: str | None = None) -> dict:
+    """클라이언트 IP별 사용량 집계. /api/usage와 동일 기간 파라미터, 토큰 합계 내림차순."""
+    start_dt, end_epoch, end_str = _resolve_range(start, end)
+
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT COALESCE(client_ip, '') AS client_ip, COUNT(*),"
+            " SUM(prompt_tokens), SUM(completion_tokens)"
+            " FROM usage WHERE ts >= ? AND ts < ? GROUP BY client_ip",
+            (start_dt.timestamp(), end_epoch),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    prompt_price = _env_price("PROMPT_PRICE_KRW", DEFAULT_PROMPT_PRICE_KRW)
+    completion_price = _env_price("COMPLETION_PRICE_KRW", DEFAULT_COMPLETION_PRICE_KRW)
+
+    clients = []
+    for client_ip, requests_count, prompt_tokens, completion_tokens in rows:
+        prompt_tokens = prompt_tokens or 0
+        completion_tokens = completion_tokens or 0
+        clients.append(
+            {
+                "client_ip": client_ip or "unknown",
+                "requests": requests_count,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "cost_krw": prompt_tokens * prompt_price / 1e6
+                + completion_tokens * completion_price / 1e6,
+            }
+        )
+    clients.sort(key=lambda item: item["total_tokens"], reverse=True)
+
+    return {
+        "range": {"start": start_dt.strftime("%Y-%m-%d"), "end": end_str},
+        "totals": {
+            "requests": sum(c["requests"] for c in clients),
+            "prompt_tokens": sum(c["prompt_tokens"] for c in clients),
+            "completion_tokens": sum(c["completion_tokens"] for c in clients),
+            "total_tokens": sum(c["total_tokens"] for c in clients),
+            "cost_krw": sum(c["cost_krw"] for c in clients),
+        },
+        "clients": clients,
     }
 
 
@@ -396,4 +507,4 @@ async def web_fallback(path: str) -> FileResponse:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, proxy_headers=False)
