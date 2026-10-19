@@ -120,3 +120,31 @@ docker compose down                          # 정지
 - **nginx 설정 참조**: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` 필수 (외부 클라이언트 실 IP 전달).- **uvicorn XFF 신뢰 수정 (중요)**: uvicorn 기본 동작(`proxy_headers=True`)이 XFF 헤더로 클라이언트 주소를 덮어쓰는 것을 확인 → 직결 클라이언트가 XFF를 위조하면 그대로 기록되는 문제를 막기 위해 uvicorn에서 XFF 처리를 끄고 `TRUSTED_PROXIES`로 앱 레벨에서만 처리하도록 변경. Dockerfile CMD `--no-proxy-headers`, `main.py` `uvicorn.run(..., proxy_headers=False)`, `test/run_tests.sh` 전체 기동 라인에 동일 플래그 추가.
 - **run_tests.sh Windows 호환**: `pypath()`(cygpath) 변환으로 Windows(Git Bash) 개발 환경에서도 스위트 실행 가능 (Linux에서는 경로 그대로, 동작 동일). `t_api.py`에 tzdata 없는 환경을 위한 고정 오프셋 KST 폴백 추가.- **테스트 결과**: `bash test/run_tests.sh` → **PASS 19 / FAIL 0** (기존 16 + 신규 3. Windows 개발 PC에서 Git Bash + Windows Python 3.14로 실행 확인, Linux 동작에도 영향 없음).- **사용량 추이 차트 IP별 스택 (2026-09-12)**: `/api/usage`의 series 항목에 `clients` 맵(IP별 토큰 합계, 빈 IP는 "unknown") 추가. 대시보드 차트를 IP별 색상 스택 바로 변경 — 최대 8개 IP에 팔레트 색상, 초과분은 회색 "기타"로 병합, 범례(IP + 총 토큰)와 툴팁(IP별 분해, 상위 5 + 기타) 표시. `t_api.py`에 series별 `sum(clients) == total_tokens` 검증 추가.
 
+
+---
+
+## 10. 기능 추가: 실시간 모니터링 (2026-10-19)
+
+### 10.1 목적
+- 대시보드에서 진행 중 요청(개수·클라이언트 IP), vLLM KV cache 사용률, MTP 적중률, 디코드/프리필 속도를 1초마다 갱신해 확인
+- 외부 기기 2대가 vLLM(8001)에 0.5초마다 보내던 모니터링 요청을 tokenbills `:8000/metrics`로 전환 가능하게 함 (본문 동일 passthrough)
+
+### 10.2 구현 (main.py)
+- 인플라이트 트래커: `INFLIGHT` dict (rid → client IP/메서드/경로/모델/시작 시각). 메모리 전용, 프록시 재시작 시 초기화. 프록시 전 경로(502, non-stream, stream finally)에서 해제
+- `GET /api/live`: 진행 중 요청 목록 + vLLM 게이지(`kv_cache_usage_perc`, `num_requests_running/waiting`, MTP 포지션별 accepted) + 속도/적중률
+  - upstream `/metrics`는 1초당 최대 1회만 스크랩(공유 캐시 + 락) → 대시보드·외부 기기 개수 무관하게 vLLM 부하 상한
+  - upstream 실패 시 이전 스냅샷 반환, 스냅샷 없으면 `upstream.ok=false` (502 아님)
+- `GET /metrics`: upstream vLLM `/metrics` 본문 그대로 전달 (502: upstream 다운). `/v1/*` 외 경로라 기존 파스스루·웹 폴백과 충돌 없음
+
+### 10.3 속도/적중률 계산 (최근 약 5초 윈도우, 누적 카운터 Δ — 추정치)
+- MTP 적중률 = Δ`spec_decode_num_accepted_tokens` / Δ`spec_decode_num_draft_tokens`
+- 디코드 속도 = Δ`generation_tokens_total` / Δ`inter_token_latency_seconds_sum` (tok/s)
+- 프리필 속도 = Δ`prompt_tokens_total` / Δ`time_to_first_token_seconds_sum` (tok/s)
+- 윈도우 기준점: 현재 스냅샷보다 5초 이상 지난 것 중 가장 새로운 스냅샷. 요청이 없는 구간은 해당 항목 null (예: 프리필은 신규 요청 프리필 구간에만 값)
+
+### 10.4 대시보드 (static/index.html)
+- 상단 "실시간" 패널: 진행 중 요청 테이블(IP/메서드/경로/모델/경과) + 진행 중 요청 수, KV cache %, vLLM 실행/대기, MTP 적중률, 디코드/프리필 tok/s 카드. 1초 자동 갱신
+
+### 10.5 검증
+- 통합 테스트: PASS 17 / FAIL 2 — 실패 2건(9.2 신뢰 프록시 XFF, 9.3 /api/clients)은 변경 전 코드에서도 동일하게 실패 (기존 환경 이슈, 회귀 아님)
+- 실트래픽 확인: streaming 요청 중 `in_flight`에 `127.0.0.1 · chat/completions · qwen` 표시, MTP 69%·디코드 27 tok/s 계측, `/metrics` 본문 vLLM 직결과 동일 구조

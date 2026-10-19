@@ -98,6 +98,24 @@ tbody tr:hover { background: rgba(88, 166, 255, 0.06); }
   </div>
 
   <div class="panel">
+    <h2>실시간</h2>
+    <div class="cards">
+      <div class="card"><div class="label">진행 중 요청</div><div class="value" id="live-inflight">-</div></div>
+      <div class="card"><div class="label">KV cache 사용률</div><div class="value" id="live-kvcache">-</div></div>
+      <div class="card"><div class="label">vLLM 실행 / 대기</div><div class="value small" id="live-running">-</div></div>
+      <div class="card"><div class="label">MTP 적중률</div><div class="value" id="live-mtp">-</div></div>
+      <div class="card"><div class="label">디코드 속도</div><div class="value small" id="live-decode">-</div></div>
+      <div class="card"><div class="label">프리필 속도</div><div class="value small" id="live-prefill">-</div></div>
+    </div>
+    <div id="live-status" style="color:var(--muted);font-size:12px;margin:0 0 10px"></div>
+    <table>
+      <thead><tr><th>클라이언트 IP</th><th>메서드</th><th>경로</th><th>모델</th><th>경과</th></tr></thead>
+      <tbody id="livetbody"></tbody>
+    </table>
+    <div id="liveempty" class="empty" style="display:none">진행 중인 요청이 없습니다.</div>
+  </div>
+
+  <div class="panel">
     <h2>사용량 추이</h2>
     <div id="chart"></div>
 <div id="legend"></div>
@@ -144,7 +162,16 @@ tbody tr:hover { background: rgba(88, 166, 255, 0.06); }
     sumRequests: document.getElementById("sum-requests"),
     ctbody: document.getElementById("ctbody"),
     cempty: document.getElementById("cempty"),
-    legend: document.getElementById("legend")
+    legend: document.getElementById("legend"),
+    liveInflight: document.getElementById("live-inflight"),
+    liveKvcache: document.getElementById("live-kvcache"),
+    liveRunning: document.getElementById("live-running"),
+    liveMtp: document.getElementById("live-mtp"),
+    liveDecode: document.getElementById("live-decode"),
+    livePrefill: document.getElementById("live-prefill"),
+    liveStatus: document.getElementById("live-status"),
+    livetbody: document.getElementById("livetbody"),
+    liveEmpty: document.getElementById("liveempty")
   };
 
   function fmtInt(n) { return Math.round(n).toLocaleString("ko-KR"); }
@@ -379,6 +406,43 @@ tbody tr:hover { background: rgba(88, 166, 255, 0.06); }
   el.end.addEventListener("change", refresh);
   window.setInterval(refresh, 30000);
   refresh();
+
+  async function refreshLive() {
+    try {
+      var res = await fetch("/api/live", { cache: "no-store" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      var d = await res.json();
+      var up = d.upstream || {};
+      var rt = d.rates || {};
+      var inflight = d.in_flight || [];
+      el.liveInflight.textContent = String(inflight.length);
+      el.liveKvcache.textContent = up.kv_cache_usage != null ? (up.kv_cache_usage * 100).toFixed(1) + "%" : "-";
+      el.liveRunning.textContent = up.ok
+        ? (up.requests_running != null ? up.requests_running : 0) + " / " + (up.requests_waiting != null ? up.requests_waiting : 0)
+        : "-";
+      el.liveMtp.textContent = rt.mtp_hit_rate != null ? (rt.mtp_hit_rate * 100).toFixed(1) + "%" : "-";
+      el.liveDecode.textContent = rt.decode_tokens_per_s != null ? rt.decode_tokens_per_s.toFixed(1) + " tok/s" : "-";
+      el.livePrefill.textContent = rt.prefill_tokens_per_s != null ? rt.prefill_tokens_per_s.toFixed(1) + " tok/s" : "-";
+      el.liveStatus.textContent = up.ok
+        ? "vLLM 연결됨" + (rt.window_s != null ? " · 속도 윈도우 " + rt.window_s + "s" : " · 속도 윈도우 축적 중 (약 5초)")
+        : "vLLM 미연결";
+      el.livetbody.innerHTML = "";
+      el.liveEmpty.style.display = inflight.length > 0 ? "none" : "block";
+      inflight.forEach(function (r) {
+        var tr = document.createElement("tr");
+        [r.client, r.method, r.path, r.model || "-", r.elapsed_s + "s"].forEach(function (val) {
+          var td = document.createElement("td");
+          td.textContent = val;
+          tr.appendChild(td);
+        });
+        el.livetbody.appendChild(tr);
+      });
+    } catch (err) {
+      el.liveStatus.textContent = "실시간 조회 실패: " + err.message;
+    }
+  }
+  window.setInterval(refreshLive, 1000);
+  refreshLive();
 })();
 </script>
 </body>

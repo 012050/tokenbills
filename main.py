@@ -7,10 +7,12 @@
 - /health, 그리고 그 외 모든 GET 은 웹 페이지 (static/index.html) 서빙
 """
 
+import asyncio
 import ipaddress
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -48,6 +50,28 @@ HOP_BY_HOP = {
 REQUEST_DROP = HOP_BY_HOP | {"content-length"}
 # httpx가 응답 바디를 투명하게 디코딩하므로 content-encoding 은 제거, 길이는 재계산
 RESPONSE_DROP = HOP_BY_HOP | {"content-length", "content-encoding"}
+
+# --------------------------------------------------------------- 실시간 모니터링
+LIVE_METRICS_TTL = 1.0    # 초 — /api/live 의 upstream /metrics 스냅샷 캐시 주기
+RATE_WINDOW = 5.0         # 초 — 속도/적중률 슬라이딩 윈도우 (최근 5초 누적 카운터 Δ)
+
+INFLIGHT: dict[str, dict] = {}           # 처리 중 프록시 요청: rid -> 정보
+_live_metrics: dict = {"text": None, "at": 0.0}
+_live_lock = asyncio.Lock()
+_rate_history: list[tuple[float, dict]] = []    # (ts, 파싱된 메트릭) — 속도 윈도우
+
+_METRIC_LINE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+(-?[0-9.eE+]+)$")
+_LIVE_METRICS = {
+    "vllm:kv_cache_usage_perc",
+    "vllm:num_requests_running",
+    "vllm:num_requests_waiting",
+    "vllm:spec_decode_num_draft_tokens_total",
+    "vllm:spec_decode_num_accepted_tokens_total",
+    "vllm:generation_tokens_total",
+    "vllm:prompt_tokens_total",
+    "vllm:inter_token_latency_seconds_sum",
+    "vllm:time_to_first_token_seconds_sum",
+}
 
 log = logging.getLogger("tokenbills")
 
@@ -275,6 +299,21 @@ async def proxy(path: str, request: Request) -> Response:
     if request.method == "POST" and path in INJECT_USAGE_ENDPOINTS:
         body, _ = _maybe_inject_include_usage(body)
 
+    rid = uuid.uuid4().hex
+    model = ""
+    if request.method == "POST" and body:
+        try:
+            model = str(json.loads(body).get("model") or "")
+        except (ValueError, UnicodeDecodeError):
+            model = ""
+    INFLIGHT[rid] = {
+        "client": client_ip,
+        "method": request.method,
+        "path": path,
+        "model": model,
+        "started": time.time(),
+    }
+
     url = f"/v1/{path}"
     if request.url.query:
         url = f"{url}?{request.url.query}"
@@ -288,6 +327,7 @@ async def proxy(path: str, request: Request) -> Response:
         )
         resp = await upstream.send(req, stream=True)
     except httpx.HTTPError as exc:
+        INFLIGHT.pop(rid, None)
         log.error("upstream unreachable for %s %s: %s", request.method, url, exc)
         return JSONResponse(status_code=502, content={"detail": "upstream unavailable"})
 
@@ -297,8 +337,10 @@ async def proxy(path: str, request: Request) -> Response:
         except httpx.HTTPError as exc:
             log.error("upstream read error for %s %s: %s", request.method, url, exc)
             await resp.aclose()
+            INFLIGHT.pop(rid, None)
             return JSONResponse(status_code=502, content={"detail": "upstream unavailable"})
         await resp.aclose()
+        INFLIGHT.pop(rid, None)
         if is_tracked:
             _record_if_any(_usage_from_json(raw), client_ip)
         return Response(content=raw, status_code=resp.status_code, headers=_response_headers(resp))
@@ -317,6 +359,7 @@ async def proxy(path: str, request: Request) -> Response:
                 await resp.aclose()
             except Exception:
                 pass
+            INFLIGHT.pop(rid, None)
             if is_tracked:
                 _record_if_any(state["usage"], client_ip)
 
@@ -332,6 +375,160 @@ async def proxy(path: str, request: Request) -> Response:
 async def health() -> dict:
     return {"status": "ok"}
 
+
+# ---------------------------------------------- 실시간 모니터링 (/api/live, /metrics)
+
+
+def _parse_live_metrics(text: str) -> dict:
+    """upstream /metrics 텍스트에서 실시간 뷰 필요 지표만 파싱한다."""
+    values: dict = {}
+    per_pos: dict[str, float] = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        m = _METRIC_LINE.match(line)
+        if not m:
+            continue
+        name, labels, raw = m.group(1), m.group(2) or "", m.group(3)
+        try:
+            val = float(raw)
+        except ValueError:
+            continue
+        if name == "vllm:spec_decode_num_accepted_tokens_per_pos_total":
+            pos = re.search(r'position="(\d+)"', labels)
+            if pos:
+                per_pos[pos.group(1)] = val
+        elif name in _LIVE_METRICS and name not in values:
+            values[name] = val
+    values["mtp_per_pos"] = per_pos
+    return values
+
+
+async def _live_metrics_text(request: Request) -> str | None:
+    """upstream /metrics 를 가져온다 (LIVE_METRICS_TTL 동안 1회만, /api/live 공유 캐시). 실패 시 이전 스냅샷."""
+    global _live_metrics
+    if _live_metrics["text"] is not None and time.time() - _live_metrics["at"] < LIVE_METRICS_TTL:
+        return _live_metrics["text"]
+    async with _live_lock:
+        if _live_metrics["text"] is not None and time.time() - _live_metrics["at"] < LIVE_METRICS_TTL:
+            return _live_metrics["text"]
+        upstream: httpx.AsyncClient = request.app.state.upstream
+        try:
+            resp = await upstream.get("/metrics", timeout=5.0)
+            if resp.status_code == 200:
+                _live_metrics = {"text": resp.text, "at": time.time()}
+                return resp.text
+            log.warning("upstream /metrics status %s", resp.status_code)
+        except httpx.HTTPError as exc:
+            log.warning("upstream /metrics fetch failed: %s", exc)
+    return _live_metrics["text"]
+
+
+def _window_delta(key: str, base: dict, top: dict) -> float | None:
+    b, t = base.get(key), top.get(key)
+    if b is None or t is None:
+        return None
+    return t - b
+
+
+def _live_rates() -> dict:
+    """최근 약 RATE_WINDOW 의 속도/적중률. vLLM 누적 카운터의 윈도우 Δ 기준(추정치)."""
+    rates: dict = {
+        "window_s": None,
+        "mtp_hit_rate": None,
+        "mtp_accepted_delta": None,
+        "mtp_drafted_delta": None,
+        "decode_tokens_per_s": None,
+        "prefill_tokens_per_s": None,
+    }
+    if len(_rate_history) < 2:
+        return rates
+    top_ts, top = _rate_history[-1]
+    # 5초 이상 지난 스냅샷 중 가장 새로운 것을 기준점 → 윈도우 ≈ RATE_WINDOW
+    base_ts: float | None = None
+    base: dict | None = None
+    for ts, snap in _rate_history:
+        if top_ts - ts >= RATE_WINDOW:
+            base_ts, base = ts, snap
+    if base is None:
+        return rates
+    rates["window_s"] = round(top_ts - base_ts, 2)
+    drafted = _window_delta("vllm:spec_decode_num_draft_tokens_total", base, top)
+    accepted = _window_delta("vllm:spec_decode_num_accepted_tokens_total", base, top)
+    if drafted is not None and accepted is not None and drafted > 0:
+        rates["mtp_hit_rate"] = accepted / drafted
+        rates["mtp_accepted_delta"] = int(accepted)
+        rates["mtp_drafted_delta"] = int(drafted)
+    gen_tokens = _window_delta("vllm:generation_tokens_total", base, top)
+    decode_time = _window_delta("vllm:inter_token_latency_seconds_sum", base, top)
+    if gen_tokens is not None and decode_time is not None and decode_time > 0:
+        rates["decode_tokens_per_s"] = gen_tokens / decode_time
+    prompt_tokens = _window_delta("vllm:prompt_tokens_total", base, top)
+    ttft_time = _window_delta("vllm:time_to_first_token_seconds_sum", base, top)
+    if prompt_tokens is not None and ttft_time is not None and ttft_time > 0:
+        rates["prefill_tokens_per_s"] = prompt_tokens / ttft_time
+    return rates
+
+
+@app.get("/api/live")
+async def api_live(request: Request) -> dict:
+    """실시간 뷰: 진행 중 요청(클라이언트 IP 포함) + vLLM 게이지 + MTP/디코드/프리필 속도."""
+    now = time.time()
+    text = await _live_metrics_text(request)
+    current = _parse_live_metrics(text) if text is not None else None
+    if current is not None:
+        _rate_history.append((now, current))
+        cutoff = now - (RATE_WINDOW * 2 + 2)
+        while _rate_history and _rate_history[0][0] < cutoff:
+            _rate_history.pop(0)
+
+    in_flight = [
+        {
+            "client": info["client"],
+            "method": info["method"],
+            "path": info["path"],
+            "model": info["model"],
+            "elapsed_s": round(now - info["started"], 1),
+        }
+        for info in INFLIGHT.values()
+    ]
+    in_flight.sort(key=lambda item: item["elapsed_s"], reverse=True)
+
+    upstream_info: dict = {"ok": current is not None}
+    if current is not None:
+        upstream_info.update(
+            {
+                "kv_cache_usage": current.get("vllm:kv_cache_usage_perc"),
+                "requests_running": current.get("vllm:num_requests_running"),
+                "requests_waiting": current.get("vllm:num_requests_waiting"),
+                "mtp_per_pos": current.get("mtp_per_pos", {}),
+            }
+        )
+
+    return {
+        "ts": now,
+        "in_flight": in_flight,
+        "upstream": upstream_info,
+        "rates": _live_rates(),
+    }
+
+
+@app.get("/metrics")
+async def metrics_passthrough(request: Request) -> Response:
+    """upstream vLLM /metrics 를 그대로 전달 (vLLM 직결 요청과 동일 본문)."""
+    upstream: httpx.AsyncClient = request.app.state.upstream
+    try:
+        resp = await upstream.get("/metrics", timeout=5.0)
+    except httpx.HTTPError:
+        log.error("upstream unreachable for /metrics")
+        return JSONResponse(status_code=502, content={"detail": "upstream unavailable"})
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers={
+            "content-type": resp.headers.get("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        },
+    )
 
 # ------------------------------------------------------------------- /api/usage
 
